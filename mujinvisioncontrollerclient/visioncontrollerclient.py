@@ -5,6 +5,8 @@
 # system imports
 import zmq
 import json
+from threading import Thread, Lock
+import weakref
 
 # mujin imports
 from mujincontrollerclient import zmqclient
@@ -25,6 +27,11 @@ class VisionControllerClient(object):
     hostname = None  # hostname of vision controller
     commandport = None  # command port of vision controller
     configurationport = None  # configuration port of vision controller, usually command port + 2
+    statusport = None  # status port, command port + 3
+    _monitorthread = None  # status monitor thread
+    _isokmonitor = False  # whether to keep monitor thread running
+    _status = None  # status dict, protected by _statuslock
+    _statuslock = None  # lock protecting status
 
     def __init__(self, hostname, commandport, ctx=None):
         """connects to vision server, initializes vision server, and sets up parameters
@@ -35,6 +42,7 @@ class VisionControllerClient(object):
         self.hostname = hostname
         self.commandport = commandport
         self.configurationport = commandport + 2
+        self.statusport = commandport + 3
 
         if ctx is None:
             assert(self._ctxown is None)
@@ -47,11 +55,14 @@ class VisionControllerClient(object):
         self._commandsocket = zmqclient.ZmqClient(self.hostname, commandport, self._ctx)
         self._configurationsocket = zmqclient.ZmqClient(self.hostname, self.configurationport, self._ctx)
         self._isok = True
+        self._statuslock = Lock()
+        self.StartMonitorThread(timeout=3.0)
     
     def __del__(self):
         self.Destroy()
     
     def Destroy(self):
+        self.StopMonitorThread()
         self.SetDestroy()
 
         if self._commandsocket is not None:
@@ -83,6 +94,16 @@ class VisionControllerClient(object):
             self._commandsocket.SetDestroy()
         if self._configurationsocket is not None:
             self._configurationsocket.SetDestroy()
+    
+    def StartMonitorThread(self, timeout):
+        if self._monitorthread is None:
+            self._isokmonitor = True
+            self._monitorthread = Thread(name='visionmanagerStatusSubscription', target=weakref.proxy(self)._RunMonitorThread, args=[timeout])
+    
+    def StopMonitorThread(self):
+        if self._monitorthread is not None:
+            self._isokmonitor = False
+            self._monitorthread.join()
     
     def _ExecuteCommand(self, command, fireandforget=False, timeout=1.0):
         response = self._commandsocket.SendCommand(command, fireandforget=fireandforget, timeout=timeout)
